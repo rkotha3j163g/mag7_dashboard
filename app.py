@@ -1,248 +1,397 @@
 #!/usr/bin/env python3
 """
-Mag 7 Stock Dashboard — Relative Strength Edition
-Powered by Alpaca Market Data API
+Relative Strength Scanner — Web Dashboard
+Powered by yfinance (free, no API key required)
 """
-from flask import Flask, jsonify
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests, os, json
-from datetime import datetime, timedelta, timezone
+
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+import base64
+import io
+import json
+import os
+import threading
+import urllib.request
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# ── Alpaca credentials ───────────────────────────────────────────────────────
-ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
-ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
+# ── Universe helpers ──────────────────────────────────────────────────────────
 
-DATA_BASE_URL = "https://data.alpaca.markets"
-HEADERS = {
-    "APCA-API-KEY-ID":     ALPACA_API_KEY,
-    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-}
-
-MAG7 = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
-
-NAMES = {
-    "AAPL":  "Apple",   "MSFT":  "Microsoft", "GOOGL": "Alphabet",
-    "AMZN":  "Amazon",  "NVDA":  "NVIDIA",    "META":  "Meta",
-    "TSLA":  "Tesla",
-}
-COLORS = {
-    "AAPL":  "#A2AAAD", "MSFT":  "#00A4EF", "GOOGL": "#4285F4",
-    "AMZN":  "#FF9900", "NVDA":  "#76B900", "META":  "#0866FF",
-    "TSLA":  "#CC0000",
-}
+def get_sp500_universe():
+    try:
+        tables = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        )
+        tickers = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+        print(f"  S&P 500: {len(tickers)} stocks")
+        return tickers
+    except Exception as e:
+        print(f"  S&P 500 fetch failed ({e}) — using fallback")
+        return _fallback_universe()
 
 
-# ── Data helpers ─────────────────────────────────────────────────────────────
-
-def get_snapshots():
-    resp = requests.get(
-        f"{DATA_BASE_URL}/v2/stocks/snapshots",
-        headers=HEADERS,
-        params={"symbols": ",".join(MAG7), "feed": "iex"},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_bars(symbol, days=30):
-    """Fetch the last N daily bars for a symbol."""
-    end   = datetime.now(timezone.utc)
-    start = end - timedelta(days=int(days * 2.5))   # calendar-day buffer
-    resp  = requests.get(
-        f"{DATA_BASE_URL}/v2/stocks/{symbol}/bars",
-        headers=HEADERS,
-        params={
-            "timeframe": "1Day",
-            "start":     start.strftime("%Y-%m-%d"),
-            "end":       end.strftime("%Y-%m-%d"),
-            "limit":     days,
-            "feed":      "iex",
-            "sort":      "asc",
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    bars = resp.json().get("bars", [])
-    return bars[-days:] if len(bars) > days else bars
+def _fallback_universe():
+    return sorted(set([
+        "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","BRK-B","AVGO","JPM",
+        "LLY","V","UNH","XOM","MA","JNJ","PG","HD","COST","MRK","ABBV","CVX",
+        "BAC","WMT","NFLX","CRM","KO","PEP","TMO","ORCL","ACN","MCD","ABT",
+        "CSCO","ADBE","WFC","TXN","NKE","DHR","LIN","PM","NEE","DIS","INTU",
+        "AMGN","RTX","LOW","SPGI","UPS","CAT","HON","GS","MS","AMAT","ISRG",
+        "NOW","BLK","SYK","ELV","GE","BKNG","ADP","VRTX","PLD","CB","REGN",
+        "ADI","MDLZ","GILD","TJX","MMC","AMT","CI","ETN","ZTS","CME","PGR",
+        "AON","SHW","LRCX","KLAC","MO","CL","SO","DUK","NOC","LMT","GD","BA",
+        "PLTR","SNOW","DDOG","CRWD","PANW","ZS","NET","FTNT","APP","MNDY",
+        "UBER","LYFT","DASH","AMD","INTC","QCOM","MU","ARM","MRVL","ON",
+        "C","USB","PNC","TFC","COF","AXP","SCHW","ICE","APO","KKR","BX",
+        "PFE","BMY","MRNA","BIIB","ILMN","IDXX","IQV","DXCM","VEEV","ALNY",
+        "SBUX","CMG","YUM","TGT","DLTR","DG","SLB","HAL","COP","OXY",
+        "EMR","ITW","ROK","AXON","KTOS","RKLB","F","GM","DE","FCX","NEM",
+        "WM","RSG","O","SPG","VICI","EQR","AVB",
+    ]))
 
 
-def compute_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return None
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains  = [max(d, 0) for d in deltas[-period:]]
-    losses = [abs(min(d, 0)) for d in deltas[-period:]]
-    avg_g  = sum(gains) / period
-    avg_l  = sum(losses) / period
-    if avg_l == 0:
-        return 100.0
-    rs = avg_g / avg_l
-    return round(100 - 100 / (1 + rs), 1)
+# ── Price download ────────────────────────────────────────────────────────────
+
+def download_prices(tickers, period="1y"):
+    all_tickers = sorted(set(tickers + ["SPY"]))
+    total = len(all_tickers)
+    CHUNK = 100
+    batches = [all_tickers[i:i+CHUNK] for i in range(0, total, CHUNK)]
+    print(f"\n  Downloading {total} tickers in {len(batches)} batches…")
+    all_closes = {}
+
+    for idx, batch in enumerate(batches, 1):
+        print(f"  Batch {idx}/{len(batches)} ({len(batch)} tickers)…", end=" ", flush=True)
+        try:
+            raw = yf.download(
+                batch, period=period,
+                auto_adjust=True, progress=False,
+                group_by="ticker", threads=False,
+            )
+            fetched = 0
+            for ticker in batch:
+                try:
+                    if len(batch) == 1:
+                        s = raw["Close"]
+                    else:
+                        if ticker in raw.columns.get_level_values(0):
+                            s = raw[ticker]["Close"]
+                        else:
+                            continue
+                    if s is not None and not s.dropna().empty:
+                        all_closes[ticker] = s
+                        fetched += 1
+                except Exception:
+                    continue
+            print(f"✓ {fetched}/{len(batch)} ok")
+        except Exception as e:
+            print(f"✗ batch failed: {e}")
+
+    df = pd.DataFrame(all_closes)
+    df.index = pd.to_datetime(df.index)
+    df.sort_index(inplace=True)
+    return df
 
 
-def signals_for(symbol):
-    """Compute all technical signals for one symbol."""
-    bars   = get_bars(symbol, days=215)
-    closes = [b["c"] for b in bars]
-    highs  = [b["h"] for b in bars]
-    lows   = [b["l"] for b in bars]
-    if not closes:
-        return {}
+# ── RS calculations ───────────────────────────────────────────────────────────
 
-    price    = closes[-1]
-    ma200    = round(sum(closes[-200:]) / 200, 2) if len(closes) >= 200 else None
-    ma50     = round(sum(closes[-50:])  / 50,  2) if len(closes) >= 50  else None
-    rsi      = compute_rsi(closes[-30:])                  # last 30 closes for RSI-14
-    ret_30d  = round((price / closes[-30] - 1) * 100, 2)  if len(closes) >= 30 else None
-    ret_5d   = round((price / closes[-5]  - 1) * 100, 2)  if len(closes) >= 5  else None
-    w52_high = round(max(highs[-252:]), 2) if len(highs) >= 20 else None
-    w52_low  = round(min(lows[-252:]),  2) if len(lows)  >= 20 else None
+def rs_score(stock_series, spy_series):
+    if len(stock_series) < 63 or len(spy_series) < 63:
+        return np.nan
 
-    above_200    = bool(price > ma200)  if ma200 else None
-    pct_vs_200   = round((price - ma200) / ma200 * 100, 2) if ma200 else None
-    pct_frm_high = round((price - w52_high) / w52_high * 100, 2) if w52_high else None
+    def pct(s, n):
+        if len(s) < n + 1:
+            return np.nan
+        return (s.iloc[-1] / s.iloc[-n] - 1) * 100
 
-    return {
-        "ma200": ma200, "ma50": ma50,
-        "rsi": rsi,
-        "ret_30d": ret_30d, "ret_5d": ret_5d,
-        "above_200": above_200, "pct_vs_200": pct_vs_200,
-        "w52_high": w52_high, "w52_low": w52_low,
-        "pct_from_high": pct_frm_high,
-    }
+    def rel(n):
+        sp = pct(stock_series, n)
+        bp = pct(spy_series, n)
+        if np.isnan(sp) or np.isnan(bp):
+            return np.nan
+        return sp - bp
+
+    weights = [(63, 2), (126, 1), (189, 1), (252, 1)]
+    total_w = sum(w for _, w in weights)
+    score = 0.0
+    for n, w in weights:
+        r = rel(n)
+        if np.isnan(r):
+            r = 0.0
+        score += r * w
+    return score / total_w
 
 
-# ── API routes ───────────────────────────────────────────────────────────────
+def rs_line_slope(stock_series, spy_series, days=20):
+    if len(stock_series) < days or len(spy_series) < days:
+        return np.nan
+    rs_line = (stock_series / spy_series).iloc[-days:]
+    if rs_line.empty or rs_line.isna().all():
+        return np.nan
+    x = np.arange(len(rs_line))
+    slope = np.polyfit(x, rs_line.values.astype(float), 1)[0]
+    mean_rs = rs_line.mean()
+    return (slope / mean_rs * 100) if mean_rs != 0 else np.nan
 
-@app.route("/api/overview")
-def api_overview():
-    data   = get_snapshots()
-    result = []
-    for sym in MAG7:
-        snap  = data.get(sym, {})
-        daily = snap.get("dailyBar", {})
-        prev  = snap.get("prevDailyBar", {})
-        quote = snap.get("latestQuote", {})
 
-        close  = daily.get("c") or quote.get("ap") or 0
-        prev_c = prev.get("c") or close
-        chg    = close - prev_c
-        pct    = (chg / prev_c * 100) if prev_c else 0
+def above_ma(series, window):
+    if len(series) < window:
+        return False
+    ma = series.rolling(window=window, min_periods=window).mean().iloc[-1]
+    return bool(series.iloc[-1] > ma)
 
-        result.append({
-            "symbol": sym, "name": NAMES[sym], "color": COLORS[sym],
-            "price":  round(close, 2),
-            "change": round(chg, 2),
-            "pct":    round(pct, 2),
-            "open":   round(daily.get("o") or 0, 2),
-            "high":   round(daily.get("h") or 0, 2),
-            "low":    round(daily.get("l") or 0, 2),
-            "volume": daily.get("v") or 0,
-            "vwap":   round(daily.get("vw") or 0, 2),
+
+def pct_from_high(series, window=252):
+    if series.empty:
+        return np.nan
+    high = series.iloc[-window:].max() if len(series) >= window else series.max()
+    return (series.iloc[-1] / high - 1) * 100
+
+
+def run_scan_df(prices, min_price=5.0):
+    spy = prices["SPY"].dropna()
+    spy_dd = pct_from_high(spy)
+    rows = []
+    tickers = [c for c in prices.columns if c != "SPY"]
+    total = len(tickers)
+    print(f"\n  Computing RS metrics for {total} stocks…")
+
+    for i, ticker in enumerate(tickers, 1):
+        if i % 100 == 0:
+            print(f"    {i}/{total}…")
+        s = prices[ticker].dropna()
+        if s.empty or s.iloc[-1] < min_price or len(s) < 63:
+            continue
+        score = rs_score(s, spy)
+        slope = rs_line_slope(s, spy, days=20)
+        dd = pct_from_high(s)
+        spy_delta = dd - spy_dd
+        price = round(float(s.iloc[-1]), 2)
+        chg_1m = (s.iloc[-1] / s.iloc[-21] - 1) * 100 if len(s) >= 22 else np.nan
+        chg_3m = (s.iloc[-1] / s.iloc[-63] - 1) * 100 if len(s) >= 64 else np.nan
+
+        rows.append({
+            "Ticker":       ticker,
+            "Price":        price,
+            "RS_Score":     round(float(score), 1)     if not np.isnan(score) else np.nan,
+            "RS_Slope_20d": round(float(slope), 2)     if not np.isnan(slope) else np.nan,
+            "Drawdown%":    round(float(dd), 1)        if not np.isnan(dd)    else np.nan,
+            "vs_SPY_DD":    round(float(spy_delta), 1) if not np.isnan(spy_delta) else np.nan,
+            "Chg_1M%":      round(float(chg_1m), 1)   if not np.isnan(chg_1m) else np.nan,
+            "Chg_3M%":      round(float(chg_3m), 1)   if not np.isnan(chg_3m) else np.nan,
+            "Above_21MA":   above_ma(s, 21),
+            "Above_50MA":   above_ma(s, 50),
+            "Above_200MA":  above_ma(s, 200),
         })
-    return jsonify(result)
+
+    df = pd.DataFrame(rows).dropna(subset=["RS_Score"])
+    df["RS_Rank"] = df["RS_Score"].rank(pct=True).mul(99).round(0).astype(int)
+    df.sort_values("RS_Score", ascending=False, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
 
 
-@app.route("/api/signals")
-def api_signals():
-    """Fetch bars for all 7 in parallel, compute RS + technicals."""
-    raw = {}
-    with ThreadPoolExecutor(max_workers=7) as pool:
-        futures = {pool.submit(signals_for, sym): sym for sym in MAG7}
-        for fut in as_completed(futures):
-            sym = futures[fut]
-            try:
-                raw[sym] = fut.result()
-            except Exception as e:
-                raw[sym] = {"error": str(e)}
+# ── RS Line Chart (base64 PNG) ────────────────────────────────────────────────
 
-    # RS rank by 30-day return (1 = strongest)
-    ranked = sorted(
-        [(sym, raw[sym].get("ret_30d") or -999) for sym in MAG7],
-        key=lambda x: x[1], reverse=True,
-    )
-    for rank, (sym, _) in enumerate(ranked, 1):
-        raw[sym]["rs_rank"] = rank
+def make_chart_b64(df, prices, top_n=15):
+    leaders = df.head(top_n)["Ticker"].tolist()
+    spy = prices["SPY"].dropna()
 
-    # Simple actionable signal
-    for sym in MAG7:
-        d = raw[sym]
-        rsi      = d.get("rsi")
-        above200 = d.get("above_200")
-        rank     = d.get("rs_rank", 4)
+    fig, ax = plt.subplots(figsize=(13, 6))
+    fig.patch.set_facecolor("#0d1117")
+    ax.set_facecolor("#161b22")
+    colors = plt.cm.tab20.colors
 
-        if above200 and rsi and rsi < 70 and rank <= 2:
-            d["signal"] = "STRONG"
-        elif above200 and rsi and rsi < 70:
-            d["signal"] = "BULLISH"
-        elif rsi and rsi > 70:
-            d["signal"] = "OVERBOUGHT"
-        elif rsi and rsi < 30:
-            d["signal"] = "OVERSOLD"
-        elif not above200 and rank >= 6:
-            d["signal"] = "WEAK"
+    for i, ticker in enumerate(leaders):
+        if ticker not in prices.columns:
+            continue
+        s = prices[ticker].dropna()
+        common = s.index.intersection(spy.index)
+        if len(common) < 20:
+            continue
+        rs = s[common] / spy[common]
+        rs_norm = rs / rs.iloc[0] * 100
+        ax.plot(rs_norm.index, rs_norm.values,
+                color=colors[i % len(colors)], linewidth=1.4,
+                label=ticker, alpha=0.9)
+
+    ax.axhline(100, color="#8b949e", linewidth=0.8, linestyle="--", alpha=0.5, label="SPY baseline")
+    ax.set_title(f"RS Lines — Top {top_n} Leaders  (stock / SPY, normalized to 100)",
+                 color="#e6edf3", fontsize=11, pad=10)
+    ax.set_ylabel("Relative Strength vs SPY", color="#8b949e", fontsize=9)
+    ax.tick_params(colors="#8b949e", labelsize=8)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    plt.xticks(rotation=25, ha="right")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#30363d")
+    ax.legend(loc="upper left", fontsize=7, framealpha=0.4,
+              labelcolor="#e6edf3", facecolor="#0d1117", ncol=2)
+    ax.grid(color="#30363d", linewidth=0.4, alpha=0.6)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=110, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close()
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode()
+
+
+# ── Scan state (in-memory cache) ─────────────────────────────────────────────
+
+_state = {
+    "status":       "idle",   # idle | scanning | ready | error
+    "started_at":   None,
+    "finished_at":  None,
+    "universe":     None,
+    "total_ranked": 0,
+    "results":      None,     # list of dicts, top 50
+    "spy_info":     None,
+    "chart_b64":    None,
+    "error":        None,
+}
+_lock = threading.Lock()
+
+
+def _do_scan(universe="sp500"):
+    with _lock:
+        _state["status"]     = "scanning"
+        _state["started_at"] = datetime.now().isoformat()
+        _state["universe"]   = universe
+        _state["error"]      = None
+
+    try:
+        if universe == "sp500":
+            tickers = get_sp500_universe()
         else:
-            d["signal"] = "NEUTRAL"
+            tickers = _fallback_universe()
 
-    return jsonify(raw)
+        prices = download_prices(tickers)
+
+        if "SPY" not in prices.columns:
+            raise RuntimeError("SPY data not available — check network")
+
+        spy = prices["SPY"].dropna()
+        spy_info = {
+            "price":    round(float(spy.iloc[-1]), 2),
+            "drawdown": round(float(pct_from_high(spy)), 2),
+            "chg_1m":   round(float((spy.iloc[-1] / spy.iloc[-21] - 1) * 100), 2) if len(spy) >= 22 else 0,
+            "chg_3m":   round(float((spy.iloc[-1] / spy.iloc[-63] - 1) * 100), 2) if len(spy) >= 64 else 0,
+        }
+
+        df = run_scan_df(prices)
+
+        results = []
+        for rank, (_, row) in enumerate(df.head(50).iterrows(), 1):
+            results.append({
+                "rank":      rank,
+                "ticker":    row["Ticker"],
+                "price":     row["Price"],
+                "rs_rank":   int(row["RS_Rank"]),
+                "chg_1m":    row["Chg_1M%"],
+                "chg_3m":    row["Chg_3M%"],
+                "drawdown":  row["Drawdown%"],
+                "vs_spy":    row["vs_SPY_DD"],
+                "slope":     row["RS_Slope_20d"] if not pd.isna(row["RS_Slope_20d"]) else None,
+                "above_21":  bool(row["Above_21MA"]),
+                "above_50":  bool(row["Above_50MA"]),
+                "above_200": bool(row["Above_200MA"]),
+            })
+
+        print("  Building chart…")
+        chart_b64 = make_chart_b64(df, prices, top_n=15)
+
+        with _lock:
+            _state["status"]       = "ready"
+            _state["finished_at"]  = datetime.now().isoformat()
+            _state["results"]      = results
+            _state["spy_info"]     = spy_info
+            _state["total_ranked"] = len(df)
+            _state["chart_b64"]    = chart_b64
+
+        print(f"\n  Scan complete — {len(df)} stocks ranked.\n")
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        with _lock:
+            _state["status"] = "error"
+            _state["error"]  = str(e)
 
 
-@app.route("/api/chart/<symbol>")
-def api_chart(symbol):
-    if symbol not in MAG7:
-        return jsonify({"error": "invalid symbol"}), 400
-    bars       = get_bars(symbol, days=230)
-    disp       = bars[-30:] if len(bars) >= 30 else bars
-    all_closes = [b["c"] for b in bars]
-    n          = len(bars)
-    disp_start = n - len(disp)
-
-    ma200, ma50 = [], []
-    for i in range(disp_start, n):
-        ma200.append(round(sum(all_closes[max(0,i-199):i+1]) / min(i+1, 200), 2) if i >= 199 else None)
-        ma50.append( round(sum(all_closes[max(0,i-49):i+1])  / min(i+1, 50),  2) if i >= 49  else None)
-
-    closes = [round(b["c"], 2) for b in disp]
-    base   = closes[0] if closes else 1
-    return jsonify({
-        "dates":  [b["t"][:10] for b in disp],
-        "closes": closes,
-        "normed": [round((c - base) / base * 100, 2) for c in closes],
-        "ma200":  ma200,
-        "ma50":   ma50,
-    })
+def start_scan(universe="sp500"):
+    t = threading.Thread(target=_do_scan, args=(universe,), daemon=True)
+    t.start()
 
 
-@app.route("/api/compare")
-def api_compare():
-    out = {}
-    with ThreadPoolExecutor(max_workers=7) as pool:
-        def _fetch(sym):
-            bars   = get_bars(sym, days=30)
-            closes = [round(b["c"], 2) for b in bars]
-            base   = closes[0] if closes else 1
-            return sym, {
-                "dates":  [b["t"][:10] for b in bars],
-                "normed": [round((c - base) / base * 100, 2) for c in closes],
-                "color":  COLORS[sym],
-            }
-        for sym, val in pool.map(_fetch, MAG7):
-            out[sym] = val
-    return jsonify(out)
+# ── Kick off initial scan when first request arrives ──────────────────────────
+
+_init_done = False
+_init_lock = threading.Lock()
+
+@app.before_request
+def _init_on_first_request():
+    global _init_done
+    if not _init_done:
+        with _init_lock:
+            if not _init_done:
+                _init_done = True
+                start_scan()
 
 
-# ── HTML ─────────────────────────────────────────────────────────────────────
+# ── API routes ────────────────────────────────────────────────────────────────
+
+@app.route("/api/status")
+def api_status():
+    with _lock:
+        return jsonify({k: v for k, v in _state.items() if k != "chart_b64"})
+
+
+@app.route("/api/results")
+def api_results():
+    with _lock:
+        return jsonify({
+            "status":       _state["status"],
+            "finished_at":  _state["finished_at"],
+            "universe":     _state["universe"],
+            "total_ranked": _state["total_ranked"],
+            "spy_info":     _state["spy_info"],
+            "results":      _state["results"],
+            "chart_b64":    _state["chart_b64"],
+        })
+
+
+@app.route("/api/rescan", methods=["POST"])
+def api_rescan():
+    with _lock:
+        if _state["status"] == "scanning":
+            return jsonify({"error": "Scan already running"}), 409
+    universe = request.json.get("universe", "sp500") if request.is_json else "sp500"
+    start_scan(universe)
+    return jsonify({"ok": True, "universe": universe})
+
+
+# ── Frontend ──────────────────────────────────────────────────────────────────
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Mag 7 · Relative Strength Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<title>RS Scanner — Relative Strength Leaders</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
@@ -255,368 +404,403 @@ HTML = r"""<!DOCTYPE html>
   --red:     #f85149;
   --amber:   #f0a500;
   --blue:    #58a6ff;
+  --purple:  #bc8cff;
 }
 body { background: var(--bg); color: var(--text);
-       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+       min-height: 100vh; }
 
-/* ── Header ── */
 header {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 16px 32px; border-bottom: 1px solid var(--border);
+  padding: 14px 28px; border-bottom: 1px solid var(--border);
   background: var(--surface); position: sticky; top: 0; z-index: 10;
+  flex-wrap: wrap; gap: 10px;
 }
-header h1 { font-size: 1.2rem; font-weight: 700; }
+header h1 { font-size: 1.1rem; font-weight: 700; white-space: nowrap; }
 header h1 span { color: var(--amber); }
-header h1 small { font-size: .72rem; color: var(--muted); margin-left: 8px; font-weight: 400; }
-.hdr-right { display: flex; align-items: center; gap: 14px; }
-#last-updated { font-size: .76rem; color: var(--muted); }
-.btn { background: #238636; border: none; color: #fff; padding: 6px 14px;
-       border-radius: 6px; cursor: pointer; font-size: .82rem; font-weight: 600;
-       transition: background .2s; }
+.hdr-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+#scan-meta { font-size: .76rem; color: var(--muted); }
+
+.btn {
+  background: #238636; border: none; color: #fff; padding: 6px 14px;
+  border-radius: 6px; cursor: pointer; font-size: .82rem; font-weight: 600;
+  transition: background .2s; white-space: nowrap;
+}
 .btn:hover { background: #2ea043; }
-#sort-btn { background: #1f3a5f; }
-#sort-btn:hover { background: #2255a0; }
+.btn:disabled { background: #1c3526; color: #4a7c59; cursor: not-allowed; }
+.btn-secondary { background: #1f3a5f; }
+.btn-secondary:hover { background: #2255a0; }
 
-main { max-width: 1500px; margin: 0 auto; padding: 24px 20px; }
+main { max-width: 1400px; margin: 0 auto; padding: 20px 16px; }
 
-/* ── RS Bar ── */
-#rs-bar {
-  display: flex; gap: 8px; margin-bottom: 24px;
+/* Scanning overlay */
+#scan-overlay {
+  display: none; text-align: center; padding: 80px 20px;
+  color: var(--muted);
+}
+#scan-overlay.visible { display: block; }
+.spinner {
+  width: 40px; height: 40px; border: 3px solid var(--border);
+  border-top-color: var(--amber); border-radius: 50%;
+  animation: spin .8s linear infinite; margin: 0 auto 20px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#scan-overlay p { font-size: 1rem; margin-bottom: 8px; }
+#scan-overlay small { font-size: .78rem; color: var(--muted); }
+
+/* SPY bar */
+#spy-bar {
+  display: flex; gap: 24px; align-items: center; flex-wrap: wrap;
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: 10px; padding: 12px 16px; align-items: center; flex-wrap: wrap;
+  border-radius: 8px; padding: 10px 18px; margin-bottom: 18px;
+  font-size: .82rem;
 }
-#rs-bar .rs-label { font-size: .72rem; color: var(--muted); margin-right: 6px; white-space: nowrap; }
-.rs-badge {
-  display: flex; align-items: center; gap: 5px;
-  background: #0d1117; border: 1px solid var(--border);
-  border-radius: 20px; padding: 4px 10px; font-size: .78rem; font-weight: 600;
-  cursor: pointer; transition: border-color .15s;
+#spy-bar .label { color: var(--muted); font-size: .74rem; font-weight: 600;
+                  letter-spacing: .5px; text-transform: uppercase; }
+#spy-bar .val { font-weight: 700; }
+
+/* Table */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+thead th {
+  background: var(--surface); color: var(--muted); font-size: .72rem;
+  font-weight: 700; letter-spacing: .5px; text-transform: uppercase;
+  padding: 9px 10px; border-bottom: 1px solid var(--border);
+  text-align: right; white-space: nowrap; cursor: pointer;
+  user-select: none;
 }
-.rs-badge:hover { border-color: var(--amber); }
-.rs-badge .rank { color: var(--amber); font-size: .68rem; }
-.rs-badge .ret  { font-size: .72rem; }
+thead th:first-child,
+thead th:nth-child(2) { text-align: left; }
+thead th:hover { color: var(--text); }
+thead th.sort-asc::after  { content: " ↑"; color: var(--amber); }
+thead th.sort-desc::after { content: " ↓"; color: var(--amber); }
 
-/* ── Cards ── */
-.cards {
-  display: grid;
-  grid-template-columns: repeat(7, 1fr);
-  gap: 12px; margin-bottom: 28px;
+tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
+tbody tr:hover { background: #1c2128; }
+tbody td { padding: 9px 10px; text-align: right; }
+tbody td:first-child { text-align: left; color: var(--muted); font-size: .75rem; }
+tbody td:nth-child(2) { text-align: left; }
+
+.ticker { font-weight: 700; font-size: .88rem; color: var(--text); }
+.price  { color: var(--muted); font-size: .8rem; margin-top: 1px; }
+.rs-pill {
+  display: inline-block; padding: 2px 8px; border-radius: 10px;
+  font-weight: 800; font-size: .78rem; min-width: 36px; text-align: center;
 }
-@media (max-width: 1100px) { .cards { grid-template-columns: repeat(4, 1fr); } }
-@media (max-width: 700px)  { .cards { grid-template-columns: repeat(2, 1fr); } }
+.rs-high   { background: #0d3320; color: #3fb950; border: 1px solid #3fb950; }
+.rs-mid    { background: #1f3a5f; color: #58a6ff; border: 1px solid #58a6ff; }
+.rs-low    { background: #2a1f00; color: #f0a500; border: 1px solid #f0a500; }
+.up   { color: var(--green); }
+.dn   { color: var(--red); }
+.neu  { color: var(--muted); }
 
-.card {
-  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-  padding: 14px 13px; cursor: pointer; transition: border-color .2s, transform .15s;
-  position: relative; overflow: hidden;
+.ma-dots { display: flex; gap: 3px; justify-content: flex-end; }
+.dot {
+  width: 22px; height: 18px; border-radius: 3px; font-size: .6rem;
+  font-weight: 700; display: flex; align-items: center; justify-content: center;
 }
-.card:hover, .card.active { border-color: var(--accent); transform: translateY(-2px); }
-.card::before { content:''; position:absolute; top:0; left:0; right:0; height:3px; background: var(--accent); }
+.dot.yes { background: #0d3320; color: #3fb950; }
+.dot.no  { background: #300; color: #f85149; }
 
-.card-top { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; }
-.ticker  { font-size: .72rem; font-weight: 700; color: var(--muted); letter-spacing: 1px; }
-.sig-badge {
-  font-size: .58rem; font-weight: 700; padding: 2px 6px; border-radius: 4px;
-  text-transform: uppercase; letter-spacing: .5px;
+.slope-up  { color: var(--green); }
+.slope-dn  { color: var(--red); }
+.slope-neu { color: var(--muted); }
+
+/* Chart */
+#chart-section { margin-top: 24px; }
+#chart-section h3 { font-size: .85rem; color: var(--muted); margin-bottom: 12px; font-weight: 600; }
+#chart-img { width: 100%; border-radius: 8px; border: 1px solid var(--border); display: none; }
+#chart-img.visible { display: block; }
+
+.error-msg {
+  color: var(--red); background: #300; border: 1px solid var(--red);
+  border-radius: 8px; padding: 12px 16px; margin: 16px 0; font-size: .88rem;
 }
-.sig-STRONG     { background: #0d3320; color: #3fb950; border: 1px solid #3fb950; }
-.sig-BULLISH    { background: #0d2a1a; color: #56d975; border: 1px solid #3fb950; }
-.sig-OVERBOUGHT { background: #3a2000; color: #f0a500; border: 1px solid #f0a500; }
-.sig-OVERSOLD   { background: #300010; color: #f85149; border: 1px solid #f85149; }
-.sig-WEAK       { background: #300; color: #f85149; border: 1px solid #f85149; }
-.sig-NEUTRAL    { background: #1c2128; color: #8b949e; border: 1px solid #30363d; }
 
-.company { font-size: .75rem; color: var(--muted); margin-bottom: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.price   { font-size: 1.3rem; font-weight: 700; }
-.chg     { font-size: .78rem; font-weight: 600; margin-top: 3px; }
-.chg.up  { color: var(--green); }
-.chg.dn  { color: var(--red); }
-
-.divider { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
-
-.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 8px; }
-.sl    { font-size: .62rem; color: var(--muted); }
-.sv    { font-size: .72rem; font-weight: 600; }
-.sv.up { color: var(--green); }
-.sv.dn { color: var(--red); }
-.sv.ob { color: var(--amber); }  /* overbought RSI */
-.sv.os { color: var(--blue); }   /* oversold RSI */
-
-.ma-row { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; gap: 4px; }
-.ma-pill {
-  font-size: .6rem; font-weight: 700; padding: 2px 6px; border-radius: 4px; flex: 1; text-align: center;
-}
-.ma-pill.above { background: #0d3320; color: #3fb950; }
-.ma-pill.below { background: #300;    color: #f85149; }
-.ma-pill.na    { background: #1c2128; color: #8b949e; }
-
-.rs-rank-row { text-align: center; margin-top: 6px; font-size: .65rem; color: var(--muted); }
-.rs-rank-row span { color: var(--amber); font-weight: 700; font-size: .8rem; }
-
-/* ── Charts ── */
-.charts-row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-@media (max-width: 800px) { .charts-row { grid-template-columns: 1fr; } }
-.chart-box {
+/* Legend */
+.legend {
+  margin-top: 14px; padding: 10px 14px;
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: 10px; padding: 18px;
+  border-radius: 8px; font-size: .74rem; color: var(--muted); line-height: 1.7;
 }
-.chart-box h3 { font-size: .85rem; color: var(--muted); margin-bottom: 12px; font-weight: 600; }
-.chart-box h3 span { color: var(--text); }
-canvas { width: 100% !important; }
-
-.spinner   { text-align:center; padding:50px; color:var(--muted); }
-.error-msg { color:var(--red); background:#300; border:1px solid var(--red);
-             border-radius:8px; padding:12px 16px; margin:16px 0; font-size:.88rem; }
+.legend b { color: var(--text); }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>Mag <span>7</span> Dashboard <small>Relative Strength Edition</small></h1>
+  <h1>Relative <span>Strength</span> Scanner</h1>
   <div class="hdr-right">
-    <span id="last-updated">Loading…</span>
-    <button class="btn" id="sort-btn" onclick="toggleSort()">⇅ Sort by RS</button>
-    <button class="btn" onclick="loadAll()">↻ Refresh</button>
+    <span id="scan-meta">Starting scan…</span>
+    <select id="universe-sel" style="background:#1c2128;border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:.82rem">
+      <option value="sp500">S&amp;P 500</option>
+      <option value="fallback">Core 150</option>
+    </select>
+    <button class="btn" id="rescan-btn" onclick="triggerRescan()">&#8635; Rescan</button>
   </div>
 </header>
 
 <main>
   <div id="error-box"></div>
 
-  <!-- RS leaderboard bar -->
-  <div id="rs-bar"><span class="rs-label">30-Day RS Rank →</span><span style="color:var(--muted);font-size:.8rem">Loading signals…</span></div>
-
-  <!-- Stock cards -->
-  <div id="cards-container" class="cards">
-    <div class="spinner" style="grid-column:1/-1">Fetching live data…</div>
+  <!-- Scanning state -->
+  <div id="scan-overlay">
+    <div class="spinner"></div>
+    <p>Scanning market for relative strength leaders…</p>
+    <small>Downloading ~500 tickers via yfinance. This takes 3–5 minutes on first load.</small>
   </div>
 
-  <!-- Charts -->
-  <div class="charts-row">
-    <div class="chart-box">
-      <h3>Price + MA Lines — <span id="chart-title">click a card</span></h3>
-      <canvas id="priceChart" height="220"></canvas>
+  <!-- SPY benchmark -->
+  <div id="spy-bar" style="display:none">
+    <span class="label">SPY</span>
+    <span><span class="label">Price</span> &nbsp;<span class="val" id="spy-price">—</span></span>
+    <span><span class="label">1M</span> &nbsp;<span class="val" id="spy-1m">—</span></span>
+    <span><span class="label">3M</span> &nbsp;<span class="val" id="spy-3m">—</span></span>
+    <span><span class="label">52W DD</span> &nbsp;<span class="val" id="spy-dd">—</span></span>
+    <span style="margin-left:auto;color:var(--muted);font-size:.75rem" id="ranked-count"></span>
+  </div>
+
+  <!-- Leaderboard -->
+  <div id="results-section" style="display:none">
+    <div class="table-wrap">
+      <table id="rs-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th data-col="ticker">Ticker</th>
+            <th data-col="rs_rank">RS Rank</th>
+            <th data-col="price">Price</th>
+            <th data-col="chg_1m">1M Chg</th>
+            <th data-col="chg_3m">3M Chg</th>
+            <th data-col="drawdown">Drawdown</th>
+            <th data-col="vs_spy">vs SPY DD</th>
+            <th data-col="slope">RS Slope</th>
+            <th>MAs 21/50/200</th>
+          </tr>
+        </thead>
+        <tbody id="rs-tbody"></tbody>
+      </table>
     </div>
-    <div class="chart-box">
-      <h3>30-Day Return Comparison <span style="font-size:.72rem;color:var(--muted)">(% from equal start)</span></h3>
-      <canvas id="compareChart" height="220"></canvas>
+
+    <div class="legend">
+      <b>RS Rank</b>: IBD-style percentile vs universe (99 = strongest, weighted recent performance). &nbsp;
+      <b>vs SPY DD</b>: your drawdown minus SPY's — positive means holding up better than the market. &nbsp;
+      <b>RS Slope</b>: 20-day trend of the stock/SPY ratio — positive = RS line is rising (gaining on market). &nbsp;
+      <b>MAs</b>: whether price is above the 21 / 50 / 200-day moving average.
+    </div>
+
+    <!-- Chart -->
+    <div id="chart-section">
+      <h3>RS Lines — Top 15 Leaders &nbsp;<span style="font-size:.72rem;color:var(--muted)">(stock/SPY normalized to 100 at start of year)</span></h3>
+      <img id="chart-img" alt="RS Lines chart">
     </div>
   </div>
 </main>
 
 <script>
-const COLORS  = __COLORS__;
-let priceChart = null, compareChart = null;
-let activeSymbol = null;
-let overviewData = [];
-let signalsData  = {};
-let sortByRS     = false;
+let _data = [];
+let _sortCol = null;
+let _sortAsc = true;
+let _pollTimer = null;
 
-const fmt    = n => n == null ? '—' : n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
-const fmtVol = v => v >= 1e9 ? (v/1e9).toFixed(2)+'B' : v >= 1e6 ? (v/1e6).toFixed(2)+'M' : v.toLocaleString();
-const fmtPct = v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+const fmt2 = n => n == null ? '—' : n.toFixed(2);
+const fmtPct = n => n == null ? '—' : (n >= 0 ? '+' : '') + n.toFixed(1) + '%';
+const fmtPctC = (n, el) => {
+  const s = fmtPct(n);
+  if (n == null) { el.textContent = s; el.className = 'neu'; return; }
+  el.textContent = s;
+  el.className = n >= 0 ? 'up' : 'dn';
+};
 
-function showError(msg) {
-  document.getElementById('error-box').innerHTML = `<div class="error-msg">⚠ ${msg}</div>`;
+function rsPillClass(rs) {
+  if (rs >= 80) return 'rs-high';
+  if (rs >= 60) return 'rs-mid';
+  return 'rs-low';
 }
 
-/* ── RS leaderboard bar ── */
-function renderRSBar(signals) {
-  const el = document.getElementById('rs-bar');
-  el.innerHTML = '<span class="rs-label">30-Day RS Rank →</span>';
-  const ranked = Object.entries(signals)
-    .filter(([,d]) => d.rs_rank != null)
-    .sort((a,b) => a[1].rs_rank - b[1].rs_rank);
-  ranked.forEach(([sym, d]) => {
-    const up  = (d.ret_30d || 0) >= 0;
-    const btn = document.createElement('div');
-    btn.className = 'rs-badge';
-    btn.style.borderColor = COLORS[sym] + '80';
-    btn.innerHTML = `
-      <span class="rank">#${d.rs_rank}</span>
-      <span style="color:${COLORS[sym]};font-weight:700">${sym}</span>
-      <span class="ret" style="color:${up?'#3fb950':'#f85149'}">${fmtPct(d.ret_30d)}</span>`;
-    btn.onclick = () => loadPriceChart(sym);
-    el.appendChild(btn);
+function renderTable(rows) {
+  const tbody = document.getElementById('rs-tbody');
+  tbody.innerHTML = '';
+  rows.forEach((r, i) => {
+    const tr = document.createElement('tr');
+
+    // MA dots
+    const makeDot = (label, val) =>
+      `<div class="dot ${val ? 'yes' : 'no'}">${label}</div>`;
+
+    const slopeClass = r.slope == null ? 'slope-neu' : r.slope > 0 ? 'slope-up' : 'slope-dn';
+    const slopeText  = r.slope == null ? '—' : (r.slope > 0 ? '+' : '') + r.slope.toFixed(2);
+
+    tr.innerHTML = `
+      <td>${i + 1}</td>
+      <td>
+        <div class="ticker">${r.ticker}</div>
+        <div class="price">$${fmt2(r.price)}</div>
+      </td>
+      <td><span class="rs-pill ${rsPillClass(r.rs_rank)}">${r.rs_rank}</span></td>
+      <td>$${fmt2(r.price)}</td>
+      <td class="${r.chg_1m >= 0 ? 'up' : 'dn'}">${fmtPct(r.chg_1m)}</td>
+      <td class="${r.chg_3m >= 0 ? 'up' : 'dn'}">${fmtPct(r.chg_3m)}</td>
+      <td class="${(r.drawdown || 0) >= 0 ? 'up' : 'dn'}">${fmtPct(r.drawdown)}</td>
+      <td class="${(r.vs_spy || 0) >= 0 ? 'up' : 'dn'}">${fmtPct(r.vs_spy)}</td>
+      <td class="${slopeClass}">${slopeText}</td>
+      <td>
+        <div class="ma-dots">
+          ${makeDot('21', r.above_21)}
+          ${makeDot('50', r.above_50)}
+          ${makeDot('200', r.above_200)}
+        </div>
+      </td>`;
+    tbody.appendChild(tr);
   });
 }
 
-/* ── Cards ── */
-function renderCards(stocks, signals) {
-  const el     = document.getElementById('cards-container');
-  const sorted = sortByRS
-    ? [...stocks].sort((a, b) => (signals[a.symbol]?.rs_rank || 99) - (signals[b.symbol]?.rs_rank || 99))
-    : stocks;
-
-  el.innerHTML = '';
-  sorted.forEach(s => {
-    const sig = signals[s.symbol] || {};
-    const up  = s.pct >= 0;
-    const div = document.createElement('div');
-    div.className = 'card' + (activeSymbol === s.symbol ? ' active' : '');
-    div.style.setProperty('--accent', s.color);
-
-    // 200D MA pill
-    const ma200pill = sig.ma200 == null ? `<span class="ma-pill na">200D N/A</span>`
-      : sig.above_200
-        ? `<span class="ma-pill above">▲ 200D +${Math.abs(sig.pct_vs_200||0).toFixed(1)}%</span>`
-        : `<span class="ma-pill below">▼ 200D ${(sig.pct_vs_200||0).toFixed(1)}%</span>`;
-
-    // 50D MA pill
-    const ma50val  = sig.ma50  ? `$${fmt(sig.ma50)}`  : '—';
-    const ma50cls  = sig.ma50  ? (s.price > sig.ma50 ? 'above' : 'below') : 'na';
-    const ma50pill = `<span class="ma-pill ${ma50cls}">50D $${sig.ma50 ? fmt(sig.ma50) : '—'}</span>`;
-
-    // RSI colour
-    const rsiCls = sig.rsi == null ? '' : sig.rsi > 70 ? 'ob' : sig.rsi < 30 ? 'os' : 'up';
-
-    div.innerHTML = `
-      <div class="card-top">
-        <span class="ticker">${s.symbol}</span>
-        <span class="sig-badge sig-${sig.signal || 'NEUTRAL'}">${sig.signal || '…'}</span>
-      </div>
-      <div class="company">${s.name}</div>
-      <div class="price">$${fmt(s.price)}</div>
-      <div class="chg ${up?'up':'dn'}">${up?'▲':'▼'} ${fmt(Math.abs(s.change))} (${fmt(Math.abs(s.pct))}%)</div>
-      <hr class="divider">
-      <div class="stats">
-        <div class="sl">30D Ret</div><div class="sv ${(sig.ret_30d||0)>=0?'up':'dn'}">${fmtPct(sig.ret_30d)}</div>
-        <div class="sl">5D Ret</div> <div class="sv ${(sig.ret_5d||0)>=0?'up':'dn'}">${fmtPct(sig.ret_5d)}</div>
-        <div class="sl">RSI 14</div><div class="sv ${rsiCls}">${sig.rsi ?? '—'}</div>
-        <div class="sl">Vol</div>    <div class="sv">${fmtVol(s.volume)}</div>
-        <div class="sl">VWAP</div>   <div class="sv">$${fmt(s.vwap)}</div>
-        <div class="sl">52W Hi</div> <div class="sv">${sig.pct_from_high != null ? fmtPct(sig.pct_from_high) : '—'}</div>
-      </div>
-      <div class="ma-row">${ma200pill}${ma50pill}</div>
-      <div class="rs-rank-row">RS Rank <span>${sig.rs_rank ? '#'+sig.rs_rank+' of 7' : '…'}</span></div>`;
-
-    div.addEventListener('click', () => loadPriceChart(s.symbol));
-    el.appendChild(div);
+function sortData(col) {
+  if (_sortCol === col) {
+    _sortAsc = !_sortAsc;
+  } else {
+    _sortCol = col;
+    _sortAsc = col === 'ticker';
+  }
+  document.querySelectorAll('thead th').forEach(th => {
+    th.classList.remove('sort-asc', 'sort-desc');
+    if (th.dataset.col === col) th.classList.add(_sortAsc ? 'sort-asc' : 'sort-desc');
   });
+
+  const sorted = [..._data].sort((a, b) => {
+    let va = a[col], vb = b[col];
+    if (typeof va === 'string') va = va.toLowerCase();
+    if (typeof vb === 'string') vb = vb.toLowerCase();
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    return _sortAsc ? (va > vb ? 1 : -1) : (va < vb ? 1 : -1);
+  });
+  renderTable(sorted);
 }
 
-/* ── Price chart ── */
-async function loadPriceChart(symbol) {
-  activeSymbol = symbol;
-  document.querySelectorAll('.card').forEach(c => {
-    c.classList.toggle('active', c.querySelector('.ticker')?.textContent === symbol);
-  });
-  const s   = overviewData.find(x => x.symbol === symbol);
-  const col = s ? s.color : COLORS[symbol];
-  document.getElementById('chart-title').textContent = (NAMES[symbol] || symbol) + ' (' + symbol + ')';
+// Wire up sortable headers
+document.querySelectorAll('thead th[data-col]').forEach(th => {
+  th.addEventListener('click', () => sortData(th.dataset.col));
+});
 
-  const res  = await fetch('/api/chart/' + symbol);
-  const data = await res.json();
-  if (priceChart) priceChart.destroy();
-  const ctx  = document.getElementById('priceChart').getContext('2d');
-  const grad = ctx.createLinearGradient(0, 0, 0, 260);
-  grad.addColorStop(0, col + '55'); grad.addColorStop(1, col + '00');
-
-  priceChart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: data.dates,
-      datasets: [
-        { label: 'Price',  data: data.closes, borderColor: col, backgroundColor: grad,
-          borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, fill: true, tension: 0.3 },
-        { label: '200D MA', data: data.ma200, borderColor: '#f0a500', backgroundColor: 'transparent',
-          borderWidth: 1.5, borderDash: [5,4], pointRadius: 0, fill: false, tension: 0.3, spanGaps: false },
-        { label: '50D MA',  data: data.ma50,  borderColor: '#58a6ff', backgroundColor: 'transparent',
-          borderWidth: 1.5, borderDash: [3,3], pointRadius: 0, fill: false, tension: 0.3, spanGaps: false },
-      ]
-    },
-    options: {
-      responsive: true,
-      plugins: {
-        legend: { display: true, labels: { color: '#8b949e', boxWidth: 18, padding: 10, font: {size:11},
-          filter: i => i.datasetIndex > 0 } },
-        tooltip: { callbacks: { label: c => c.parsed.y == null ? null : ` ${c.dataset.label}: $${fmt(c.parsed.y)}` } }
-      },
-      scales: {
-        x: { grid:{color:'#30363d'}, ticks:{color:'#8b949e', maxTicksLimit:6} },
-        y: { grid:{color:'#30363d'}, ticks:{color:'#8b949e', callback: v => '$'+v} }
-      }
-    }
-  });
+function showSpy(spy) {
+  const bar = document.getElementById('spy-bar');
+  bar.style.display = 'flex';
+  document.getElementById('spy-price').textContent = '$' + fmt2(spy.price);
+  const set1m = document.getElementById('spy-1m');
+  set1m.textContent = fmtPct(spy.chg_1m);
+  set1m.className = 'val ' + (spy.chg_1m >= 0 ? 'up' : 'dn');
+  const set3m = document.getElementById('spy-3m');
+  set3m.textContent = fmtPct(spy.chg_3m);
+  set3m.className = 'val ' + (spy.chg_3m >= 0 ? 'up' : 'dn');
+  const setdd = document.getElementById('spy-dd');
+  setdd.textContent = fmtPct(spy.drawdown);
+  setdd.className = 'val dn';
 }
 
-/* ── Compare chart ── */
-async function loadCompareChart() {
-  const res  = await fetch('/api/compare');
-  const data = await res.json();
-  const syms = Object.keys(data);
-  if (compareChart) compareChart.destroy();
-  compareChart = new Chart(document.getElementById('compareChart').getContext('2d'), {
-    type: 'line',
-    data: {
-      labels: data[syms[0]].dates,
-      datasets: syms.map(sym => ({
-        label: sym, data: data[sym].normed,
-        borderColor: data[sym].color, backgroundColor: 'transparent',
-        borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: 0.3,
-      }))
-    },
-    options: {
-      responsive: true,
-      plugins: {
-        legend: { labels: { color:'#e6edf3', boxWidth:12, padding:12, font:{size:11} } },
-        tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${fmtPct(c.parsed.y)}` } }
-      },
-      scales: {
-        x: { grid:{color:'#30363d'}, ticks:{color:'#8b949e', maxTicksLimit:6} },
-        y: { grid:{color:'#30363d'}, ticks:{color:'#8b949e', callback: v => (v>=0?'+':'')+v+'%'} }
-      }
-    }
-  });
-}
+function applyResults(data) {
+  clearInterval(_pollTimer);
+  document.getElementById('scan-overlay').classList.remove('visible');
+  document.getElementById('results-section').style.display = 'block';
 
-function toggleSort() {
-  sortByRS = !sortByRS;
-  document.getElementById('sort-btn').textContent = sortByRS ? '⇅ Default Order' : '⇅ Sort by RS';
-  if (overviewData.length) renderCards(overviewData, signalsData);
-}
+  _data = data.results || [];
+  renderTable(_data);
 
-async function loadAll() {
-  document.getElementById('error-box').innerHTML = '';
-  try {
-    // 1. Fast snapshot load
-    const snap = await fetch('/api/overview');
-    if (!snap.ok) throw new Error('HTTP ' + snap.status);
-    overviewData = await snap.json();
-    renderCards(overviewData, signalsData);
-    document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  if (data.spy_info) showSpy(data.spy_info);
 
-    // Auto-select first card on initial load
-    if (!activeSymbol && overviewData.length) loadPriceChart(overviewData[0].symbol);
+  const ts = data.finished_at
+    ? 'Scanned ' + new Date(data.finished_at).toLocaleTimeString()
+    : '';
+  document.getElementById('scan-meta').textContent =
+    (ts ? ts + ' · ' : '') + (data.universe === 'sp500' ? 'S&P 500' : 'Core 150') +
+    ' · ' + (data.total_ranked || 0) + ' stocks ranked';
 
-    // 2. Charts (parallel with signals)
-    loadCompareChart();
+  document.getElementById('ranked-count').textContent =
+    'Showing top ' + _data.length + ' of ' + (data.total_ranked || 0) + ' ranked';
 
-    // 3. Signals (runs in background, updates cards when done)
-    fetch('/api/signals').then(r => r.json()).then(sigs => {
-      signalsData = sigs;
-      renderCards(overviewData, signalsData);
-      renderRSBar(signalsData);
-    }).catch(e => console.warn('Signals failed:', e));
+  document.getElementById('rescan-btn').disabled = false;
 
-  } catch(e) {
-    showError('Could not fetch data — check Alpaca API keys. (' + e.message + ')');
+  if (data.chart_b64) {
+    const img = document.getElementById('chart-img');
+    img.src = 'data:image/png;base64,' + data.chart_b64;
+    img.classList.add('visible');
   }
 }
 
-loadAll();
-setInterval(loadAll, 60000);
+function poll() {
+  fetch('/api/results')
+    .then(r => r.json())
+    .then(data => {
+      if (data.status === 'ready') {
+        applyResults(data);
+      } else if (data.status === 'error') {
+        clearInterval(_pollTimer);
+        document.getElementById('scan-overlay').classList.remove('visible');
+        document.getElementById('error-box').innerHTML =
+          `<div class="error-msg">Scan failed: ${data.error || 'unknown error'}</div>`;
+        document.getElementById('rescan-btn').disabled = false;
+      }
+      // else still scanning — keep polling
+    })
+    .catch(() => {});
+}
+
+function triggerRescan() {
+  document.getElementById('rescan-btn').disabled = true;
+  document.getElementById('error-box').innerHTML = '';
+  document.getElementById('results-section').style.display = 'none';
+  document.getElementById('scan-overlay').classList.add('visible');
+  document.getElementById('scan-meta').textContent = 'Scanning…';
+  document.getElementById('chart-img').classList.remove('visible');
+
+  const universe = document.getElementById('universe-sel').value;
+  fetch('/api/rescan', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({universe}),
+  })
+  .then(r => r.json())
+  .then(() => {
+    _pollTimer = setInterval(poll, 5000);
+  })
+  .catch(e => {
+    document.getElementById('error-box').innerHTML =
+      `<div class="error-msg">Could not start scan: ${e.message}</div>`;
+    document.getElementById('rescan-btn').disabled = false;
+  });
+}
+
+// On load: check if scan is already ready or in progress
+(function init() {
+  fetch('/api/results')
+    .then(r => r.json())
+    .then(data => {
+      if (data.status === 'ready') {
+        applyResults(data);
+      } else if (data.status === 'scanning' || data.status === 'idle') {
+        document.getElementById('scan-overlay').classList.add('visible');
+        document.getElementById('scan-meta').textContent = 'Scanning…';
+        _pollTimer = setInterval(poll, 5000);
+      } else if (data.status === 'error') {
+        document.getElementById('error-box').innerHTML =
+          `<div class="error-msg">Last scan failed: ${data.error}. Click Rescan to retry.</div>`;
+        document.getElementById('rescan-btn').disabled = false;
+      }
+    });
+})();
 </script>
 </body>
 </html>
 """
 
+
 @app.route("/")
 def index():
-    return HTML.replace("__COLORS__", json.dumps(COLORS))
+    return HTML
 
 
 if __name__ == "__main__":
+    start_scan()
     port = int(os.environ.get("PORT", 5050))
-    print(f"\n  Mag 7 RS Dashboard → http://localhost:{port}\n")
+    print(f"\n  RS Scanner Dashboard → http://localhost:{port}\n")
     app.run(debug=False, port=port)
