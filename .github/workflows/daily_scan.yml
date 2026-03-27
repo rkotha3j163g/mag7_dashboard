@@ -1,0 +1,45 @@
+name: Daily RS Scan
+
+on:
+  schedule:
+    - cron: '0 21 * * 1-5'   # 5 pm ET (21:00 UTC) every weekday
+  workflow_dispatch:           # allow manual trigger from GitHub UI
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet \
+            yfinance pandas numpy matplotlib \
+            resend requests lxml html5lib
+
+      - name: Run RS scan
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+        run: python rs_scan.py --universe sp500 --no-chart --no-email
+
+      - name: Upload CSV to dashboard
+        run: |
+          CSV=$(ls rs_scan_*.csv 2>/dev/null | sort | tail -1)
+          if [ -z "$CSV" ]; then
+            echo "ERROR: No CSV file found after scan."
+            exit 1
+          fi
+          echo "Uploading $CSV to dashboard…"
+          curl -f -X POST "${{ secrets.DASHBOARD_URL }}/upload" \
+            -H "X-Upload-Token: ${{ secrets.UPLOAD_TOKEN }}" \
+            -F "file=@$CSV"
+          echo "Done."
