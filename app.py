@@ -47,7 +47,7 @@ def get_snapshots():
     """Fetch latest snapshots (quote + daily bar) for all Mag7 tickers."""
     symbols = ",".join(MAG7)
     url = f"{DATA_BASE_URL}/v2/stocks/snapshots"
-    params = {"symbols": symbols, "feed": "iex"}
+    params = {"symbols": symbols}
     resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
     resp.raise_for_status()
     return resp.json()
@@ -64,7 +64,7 @@ def get_bars(symbol, days=30):
         "start":     start.strftime("%Y-%m-%d"),
         "end":       end.strftime("%Y-%m-%d"),
         "limit":     days,
-        "feed":      "iex",
+        "feed":      "sip",
     }
     resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
     resp.raise_for_status()
